@@ -15,11 +15,13 @@ temperature/humidity numbers, which it translates into framed writes to attribut
 own measurements.
 """
 
+import contextlib
 import struct
 import time
 from typing import Any, Final
 
 from zigpy import types as t
+from zigpy.exceptions import ZigbeeException
 from zigpy.zcl import foundation
 from zigpy.zcl.foundation import ZCLAttributeDef
 
@@ -169,13 +171,20 @@ class W100AqaraCluster(XiaomiAqaraE1Cluster):
 
     async def _send_frame(
         self, counter: int, action: int, params: bytes, **kwargs
-    ) -> list[list[foundation.WriteAttributesStatusRecord]]:
-        return await super().write_attributes(
+    ) -> foundation.Status:
+        """Write one sensor_link frame and return the device's status for it."""
+        result = await super().write_attributes(
             {self.AttributeDefs.sensor_link.id: build_frame(counter, action, params)},
             **kwargs,
         )
+        for record in result[0]:
+            if record.status != foundation.Status.SUCCESS:
+                return record.status
+        return foundation.Status.SUCCESS
 
-    async def _set_display_sensor(self, value: DisplaySensor, **kwargs) -> None:
+    async def _set_display_sensor(
+        self, value: DisplaySensor, **kwargs
+    ) -> foundation.Status:
         timestamp = t.uint32_t_be(int(time.time())).serialize()
         ieee = self.endpoint.device.ieee.serialize()[::-1]  # big-endian
         if value == DisplaySensor.External:
@@ -186,32 +195,37 @@ class W100AqaraCluster(XiaomiAqaraE1Cluster):
             action = FRAME_ACTION_UNLINK
             humidity = temperature = UNLINK_TAIL
 
-        prefix = bytes([LINK_PREFIX_HUMIDITY])
-        await self._send_frame(
-            FRAME_COUNTER_HUMIDITY,
-            action,
-            timestamp + prefix + ieee + humidity,
-            **kwargs,
+        frames = (
+            (FRAME_COUNTER_HUMIDITY, LINK_PREFIX_HUMIDITY, humidity),
+            (FRAME_COUNTER_TEMPERATURE, LINK_PREFIX_TEMPERATURE, temperature),
         )
-        prefix = bytes([LINK_PREFIX_TEMPERATURE])
-        await self._send_frame(
-            FRAME_COUNTER_TEMPERATURE,
-            action,
-            timestamp + prefix + ieee + temperature,
-            **kwargs,
-        )
+        for counter, prefix, tail in frames:
+            status = await self._send_frame(
+                counter,
+                action,
+                timestamp + bytes([prefix]) + ieee + tail,
+                **kwargs,
+            )
+            if status != foundation.Status.SUCCESS:
+                return status
         super()._update_attribute(self.AttributeDefs.display_sensor.id, value)
+
+        # The device confirms the mode in sensor_mode, which _update_attribute
+        # mirrors into display_sensor.
+        with contextlib.suppress(ZigbeeException, TimeoutError):
+            await super().read_attributes([self.AttributeDefs.sensor_mode.id])
 
         if value == DisplaySensor.External:
             for attrid in self.EXTERNAL_VALUES:
                 if (cached := self.get(attrid)) is not None:
                     await self._send_value(attrid, cached, **kwargs)
+        return foundation.Status.SUCCESS
 
-    async def _send_value(self, attrid: int, value: int, **kwargs) -> None:
+    async def _send_value(self, attrid: int, value: int, **kwargs) -> foundation.Status:
         channel, factor = self.EXTERNAL_VALUES[attrid]
         params = EXTERNAL_SENSOR_IEEE + bytes([0x00, channel, 0x00, 0x55])
         params += struct.pack(">f", value * factor)
-        await self._send_frame(
+        return await self._send_frame(
             FRAME_COUNTER_HUMIDITY, FRAME_ACTION_VALUE, params, **kwargs
         )
 
@@ -220,24 +234,43 @@ class W100AqaraCluster(XiaomiAqaraE1Cluster):
         attributes: dict[str | int | foundation.ZCLAttributeDef, Any],
         **kwargs,
     ) -> list[list[foundation.WriteAttributesStatusRecord]]:
-        """Translate the local display attributes into sensor_link frames."""
+        """Translate the local display attributes into sensor_link frames.
+
+        A local attribute is cached only once the device has accepted its frames;
+        a rejected frame comes back as a failure record for that attribute.
+        """
         remaining = {}
+        failures = []
         for attr, value in attributes.items():
             attr_def = self.find_attribute(attr)
+            status = foundation.Status.SUCCESS
             if attr_def == self.AttributeDefs.display_sensor:
-                await self._set_display_sensor(DisplaySensor(value), **kwargs)
+                status = await self._set_display_sensor(DisplaySensor(value), **kwargs)
             elif attr_def.id in self.EXTERNAL_VALUES:
                 value = attr_def.type(value)
-                self._update_attribute(attr_def.id, value)
                 if self.get(self.AttributeDefs.display_sensor.id) == (
                     DisplaySensor.External
                 ):
-                    await self._send_value(attr_def.id, value, **kwargs)
+                    status = await self._send_value(attr_def.id, value, **kwargs)
+                if status == foundation.Status.SUCCESS:
+                    self._update_attribute(attr_def.id, value)
             else:
                 remaining[attr] = value
 
+            if status != foundation.Status.SUCCESS:
+                failures.append(
+                    foundation.WriteAttributesStatusRecord(status, attr_def.id)
+                )
+
         if remaining:
-            return await super().write_attributes(remaining, **kwargs)
+            result = await super().write_attributes(remaining, **kwargs)
+            failures += [
+                record
+                for record in result[0]
+                if record.status != foundation.Status.SUCCESS
+            ]
+        if failures:
+            return [failures]
         return [[foundation.WriteAttributesStatusRecord(foundation.Status.SUCCESS)]]
 
     async def read_attributes(

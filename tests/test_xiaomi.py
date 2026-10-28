@@ -3484,8 +3484,90 @@ def test_w100_external_temperature_scaling():
     )
     assert number.multiplier == 0.1
     assert number.step == 0.1
-    # ZHA writes int(ha_value / multiplier): 12.78 °C -> 127 (12.7 °C)
-    assert int(12.78 / number.multiplier) == 127
+
+
+async def test_w100_display_sensor_confirmed_by_sensor_mode(w100_opple_cluster):
+    """After the link frames, display_sensor follows the device's sensor_mode."""
+    cluster = w100_opple_cluster
+
+    async def mock_read(attributes, manufacturer=None, **kwargs):
+        assert attributes == [0x0172]
+        cluster._update_attribute(0x0172, 0)  # device stayed internal
+        return [[]]
+
+    cluster._read_attributes = mock.AsyncMock(side_effect=mock_read)
+
+    result = await cluster.write_attributes({"display_sensor": DisplaySensor.External})
+
+    assert result == [
+        [foundation.WriteAttributesStatusRecord(foundation.Status.SUCCESS)]
+    ]
+    assert w100_written_frames(cluster) == W100_LINK_FRAMES
+    cluster._read_attributes.assert_awaited_once()
+    assert cluster.get("display_sensor") == DisplaySensor.Internal
+
+
+async def test_w100_display_sensor_read_back_failure_ignored(w100_opple_cluster):
+    """A sleepy device not answering the read-back doesn't fail the write."""
+    cluster = w100_opple_cluster
+    cluster._read_attributes = mock.AsyncMock(side_effect=TimeoutError)
+
+    result = await cluster.write_attributes({"display_sensor": DisplaySensor.External})
+
+    assert result == [
+        [foundation.WriteAttributesStatusRecord(foundation.Status.SUCCESS)]
+    ]
+    assert cluster.get("display_sensor") == DisplaySensor.External
+
+
+async def test_w100_display_sensor_rejected(w100_opple_cluster):
+    """A rejected link frame is reported and leaves display_sensor unchanged."""
+    cluster = w100_opple_cluster
+    cluster._write_attributes.return_value = [
+        [
+            foundation.WriteAttributesStatusRecord(
+                foundation.Status.INVALID_VALUE, 0xFFF2
+            )
+        ]
+    ]
+
+    result = await cluster.write_attributes({"display_sensor": DisplaySensor.External})
+
+    assert result == [
+        [
+            foundation.WriteAttributesStatusRecord(
+                foundation.Status.INVALID_VALUE, 0xFFE0
+            )
+        ]
+    ]
+    assert w100_written_frames(cluster) == W100_LINK_FRAMES[:1]
+    assert cluster.get("display_sensor") is None
+    cluster._read_attributes.assert_not_called()
+
+
+async def test_w100_external_value_rejected(w100_opple_cluster):
+    """A rejected value frame is reported and the previous value stays cached."""
+    cluster = w100_opple_cluster
+    await cluster.write_attributes({"display_sensor": DisplaySensor.External})
+    await cluster.write_attributes({"external_humidity": 45})
+
+    cluster._write_attributes.return_value = [
+        [
+            foundation.WriteAttributesStatusRecord(
+                foundation.Status.INVALID_VALUE, 0xFFF2
+            )
+        ]
+    ]
+    result = await cluster.write_attributes({"external_humidity": 50})
+
+    assert result == [
+        [
+            foundation.WriteAttributesStatusRecord(
+                foundation.Status.INVALID_VALUE, 0xFFE2
+            )
+        ]
+    ]
+    assert cluster.get("external_humidity") == 45
 
 
 async def test_w100_device_attributes_pass_through(w100_opple_cluster):
